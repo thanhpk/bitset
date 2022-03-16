@@ -888,34 +888,31 @@ func (b *BitSet) BinaryStorageSize() int {
 
 // WriteTo writes a BitSet to a stream
 func (b *BitSet) WriteTo(stream io.Writer) (int64, error) {
-	length := uint64(b.length)
+	writer := bufio.NewWriter(stream)
 
 	// Write length
-	err := binary.Write(stream, binaryOrder, length)
+	err := binary.Write(writer, binaryOrder, uint64(b.length))
 	if err != nil {
 		return 0, err
 	}
 
-	// fast path for small set
-	if length < 1048576 {
-		err = binary.Write(stream, binaryOrder, b.set)
-		return int64(b.BinaryStorageSize()), err
-	}
+	var item = make([]byte, 8)     // for serializing uint64 items
+	var n = binary.Size(uint64(0)) // bytes written
 
-	// with big set (more than 1Gb), write data in chunk to prevent
-	// high memory usage
-	const bufferCount = 8192 // number of items inside a chunk each write
-	buffer := make([]byte, bufferCount*8)
-	bitsetLen := len(b.set)
-	for i, x := range b.set {
-		binaryOrder.PutUint64(buffer[8*(i%bufferCount):], x)
-		if i%bufferCount == bufferCount-1 || i == bitsetLen-1 {
-			if _, err := stream.Write(buffer[:8*(i%bufferCount+1)]); err != nil {
-				return int64(binary.Size(uint64(0)) + i*8), err
-			}
+	// Write data manually to avoid high memory usage
+	// since the current implementation of binary.Write allocates
+	// a 8*len(b.set) bytes array.
+	for _, x := range b.set {
+		binaryOrder.PutUint64(item, x)
+		nn, err := writer.Write(item)
+		n += nn
+		if err != nil {
+			return int64(n), err
 		}
 	}
-	return int64(b.BinaryStorageSize()), nil
+
+	err = writer.Flush()
+	return int64(n), err
 }
 
 // ReadFrom reads a BitSet from a stream written using WriteTo
@@ -933,34 +930,19 @@ func (b *BitSet) ReadFrom(stream io.Reader) (int64, error) {
 		return 0, errors.New("unmarshalling error: type mismatch")
 	}
 
-	// fast path for small set
-	if length < 1048576 {
-		// Read remaining bytes as set
-		err = binary.Read(stream, binaryOrder, newset.set)
-		if err != nil {
-			return 0, err
-		}
-		*b = *newset
-		return int64(b.BinaryStorageSize()), nil
-	}
-
-	// with big set (more than 1Gb), write data in chunk to prevent
-	// high memory usage
-	const bufferCount = 8192 // number of items inside a chunk each read
-	buffer := make([]byte, bufferCount*8)
+	// Read data
+	reader := bufio.NewReader(stream)
 	count := 0
+	var item = make([]byte, 8)
 	for {
-		n, err := stream.Read(buffer[:bufferCount*8])
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
+		if _, err := reader.Read(item); err != nil {
+			if err == io.EOF {
+				break // done
+			}
 			return 0, err
 		}
-		for i := 0; i*8 < n; i++ {
-			newset.set[count] = binaryOrder.Uint64(buffer[i*8:])
-			count++
-		}
+		newset.set[count] = binaryOrder.Uint64(item)
+		count++
 	}
 
 	*b = *newset
